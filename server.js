@@ -14,13 +14,13 @@ const server = http.createServer(app);
 // });
 const io = socketIo(server, {
   cors: {
-    origin: process.env.FRONTEND_URL || "http://localhost:3000",
+    origin:"https://anonym-fawn.vercel.app/",
     methods: ["GET", "POST"]
   }
 });
 
 app.use(cors({
-  origin: process.env.FRONTEND_URL || "http://localhost:3000"
+  origin:"https://anonym-fawn.vercel.app/"
 }));
 // app.use(cors());
 app.use(express.json());

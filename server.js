@@ -20,7 +20,7 @@ const io = socketIo(server, {
 });
 
 app.use(cors({
-  origin:"https://anonym-p23v.vercel.app"
+  origin:"https://www.ochat.fun"
 }));
 // app.use(cors());
 app.use(express.json());

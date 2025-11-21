@@ -1,4 +1,4 @@
-// server.js - Enhanced Backend with Smart Conversation Management
+// server.js - Enhanced Backend with Smart Conversation Management (FIXED)
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
@@ -6,23 +6,23 @@ const cors = require('cors');
 
 const app = express();
 const server = http.createServer(app);
-// const io = socketIo(server, {
-//   cors: {
-//     origin: "http://localhost:3000",
-//     methods: ["GET", "POST"]
-//   }
-// });
 const io = socketIo(server, {
   cors: {
-    origin: process.env.FRONTEND_URL || "http://localhost:3000",
+    origin: "https://www.ochat.fun",
     methods: ["GET", "POST"]
   }
 });
+// const io = socketIo(server, {
+//   cors: {
+//     origin: process.env.FRONTEND_URL || "http://localhost:3000",
+//     methods: ["GET", "POST"]
+//   }
+// });
 
-app.use(cors({
-  origin: process.env.FRONTEND_URL || "http://localhost:3000"
-}));
-// app.use(cors());
+// app.use(cors({
+//   origin: process.env.FRONTEND_URL || "http://localhost:3000"
+// }));
+app.use(cors());
 app.use(express.json());
 
 // Enhanced storage with timestamps for auto-deletion
@@ -239,7 +239,7 @@ io.on('connection', (socket) => {
     }
   });
   
-  // Send message with real-time broadcast
+  // FIXED: Send message with proper broadcast (no duplicates)
   socket.on('send-message', ({ convId, message, isCreator }) => {
     const conversation = storage.conversations.get(convId);
     
@@ -274,8 +274,14 @@ io.on('connection', (socket) => {
     
     // console.log(`📨 Message sent in ${convId}: "${message.substring(0, 30)}..."`);
     
-    // Broadcast to ALL users in the conversation
-    io.to(convId).emit('new-message', { 
+    // FIXED: Broadcast to others only (exclude sender to prevent duplicates)
+    socket.broadcast.to(convId).emit('new-message', { 
+      convId, 
+      message: newMessage 
+    });
+    
+    // Send confirmation back to sender only (optional)
+    socket.emit('message-sent', { 
       convId, 
       message: newMessage 
     });

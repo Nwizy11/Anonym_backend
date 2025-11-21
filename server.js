@@ -1,4 +1,4 @@
-// server.js - FIXED: No duplicate messages on reconnect
+// server.js - Enhanced Backend with Smart Conversation Management (FIXED)
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
@@ -12,15 +12,24 @@ const io = socketIo(server, {
     methods: ["GET", "POST"]
   }
 });
+// const io = socketIo(server, {
+//   cors: {
+//     origin: process.env.FRONTEND_URL || "http://localhost:3000",
+//     methods: ["GET", "POST"]
+//   }
+// });
+
+// app.use(cors({
+//   origin: process.env.FRONTEND_URL || "http://localhost:3000"
+// }));
 
 app.use(cors());
 app.use(express.json());
 
-// Enhanced storage with message ID tracking
+// Enhanced storage with timestamps for auto-deletion
 const storage = {
   links: new Map(),
   conversations: new Map(),
-  processedMessageIds: new Set() // Track processed message IDs to prevent duplicates
 };
 
 // Auto-delete messages after 24 hours
@@ -58,13 +67,6 @@ function cleanupOldMessages() {
       deletedConversationsCount++;
     }
   });
-  
-  // Clean up old processed message IDs (keep last 1000)
-  if (storage.processedMessageIds.size > 1000) {
-    const idsArray = Array.from(storage.processedMessageIds);
-    const toRemove = idsArray.slice(0, 500);
-    toRemove.forEach(id => storage.processedMessageIds.delete(id));
-  }
   
   if (deletedMessagesCount > 0 || deletedConversationsCount > 0) {
     console.log(`🗑️  Cleanup: Deleted ${deletedMessagesCount} messages and ${deletedConversationsCount} empty conversations`);
@@ -155,10 +157,11 @@ app.post('/api/conversations/create', (req, res) => {
     messages: [],
     createdAt: Date.now(),
     lastMessage: Date.now(),
-    hasMessages: false
+    hasMessages: false // Track if conversation has any messages
   };
   
   storage.conversations.set(convId, conversation);
+  // DON'T add to link.conversations yet - wait for first message
   
   console.log(`💬 New conversation created: ${convId} for link: ${linkId} (waiting for first message)`);
   res.json({ conversation });
@@ -182,32 +185,28 @@ app.get('/api/conversations/:convId', (req, res) => {
   res.json({ conversation });
 });
 
-// Socket.io real-time messaging with duplicate prevention
+// Socket.io real-time messaging
 io.on('connection', (socket) => {
-  console.log('👤 User connected:', socket.id);
+  // console.log('👤 User connected:', socket.id);
   
-  // CRITICAL: Join a conversation room with optional message skip
-  socket.on('join-conversation', ({ convId, isCreator, skipMessageLoad }) => {
+  // Join a conversation room
+  socket.on('join-conversation', ({ convId, isCreator }) => {
     socket.join(convId);
     socket.convId = convId;
     socket.isCreator = isCreator;
     
-    console.log(`✅ User ${socket.id} joined conversation ${convId} as ${isCreator ? 'creator' : 'anonymous'}`);
+    // console.log(`✅ User ${socket.id} joined conversation ${convId} as ${isCreator ? 'creator' : 'anonymous'}`);
     
-    // Only send existing messages if not skipped (prevents duplicates on reconnect)
-    if (!skipMessageLoad) {
-      const conversation = storage.conversations.get(convId);
-      if (conversation) {
-        const now = Date.now();
-        const recentMessages = conversation.messages.filter(msg => 
-          (now - msg.timestamp) <= AUTO_DELETE_TIME
-        );
-        conversation.messages = recentMessages;
-        
-        socket.emit('load-messages', { messages: recentMessages });
-      }
-    } else {
-      console.log(`⏭️  Skipped message load for ${socket.id} (already has messages)`);
+    // Send existing messages
+    const conversation = storage.conversations.get(convId);
+    if (conversation) {
+      const now = Date.now();
+      const recentMessages = conversation.messages.filter(msg => 
+        (now - msg.timestamp) <= AUTO_DELETE_TIME
+      );
+      conversation.messages = recentMessages;
+      
+      socket.emit('load-messages', { messages: recentMessages });
     }
   });
   
@@ -217,7 +216,7 @@ io.on('connection', (socket) => {
     socket.linkId = linkId;
     socket.creatorId = creatorId;
     
-    console.log(`✅ Creator ${socket.id} joined link ${linkId}`);
+    // console.log(`✅ Creator ${socket.id} joined link ${linkId}`);
     
     // Send existing conversations (only those with messages)
     const link = storage.links.get(linkId);
@@ -241,8 +240,8 @@ io.on('connection', (socket) => {
     }
   });
   
-  // CRITICAL FIX: Send message with duplicate prevention
-  socket.on('send-message', ({ convId, message, isCreator, messageId }) => {
+  // FIXED: Send message with proper broadcast (no duplicates)
+  socket.on('send-message', ({ convId, message, isCreator }) => {
     const conversation = storage.conversations.get(convId);
     
     if (!conversation) {
@@ -250,23 +249,8 @@ io.on('connection', (socket) => {
       return;
     }
     
-    // CRITICAL: Check if this message was already processed
-    if (messageId && storage.processedMessageIds.has(messageId)) {
-      console.log(`⏭️  Duplicate message detected and ignored: ${messageId}`);
-      // Still send confirmation back to sender
-      socket.emit('message-sent', { 
-        convId, 
-        messageId,
-        message: conversation.messages.find(m => m.id === messageId)
-      });
-      return;
-    }
-    
-    // Generate server-side message ID if not provided
-    const finalMessageId = messageId || `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    
     const newMessage = {
-      id: finalMessageId,
+      id: Date.now() + Math.random(),
       text: message,
       isCreator,
       timestamp: Date.now()
@@ -276,37 +260,31 @@ io.on('connection', (socket) => {
     conversation.messages.push(newMessage);
     conversation.lastMessage = Date.now();
     
-    // Mark message as processed
-    if (messageId) {
-      storage.processedMessageIds.add(messageId);
-    }
-    
     // If this is the first message, add conversation to link
     if (!conversation.hasMessages) {
       conversation.hasMessages = true;
       const link = storage.links.get(conversation.linkId);
       if (link && !link.conversations.includes(convId)) {
         link.conversations.push(convId);
-        console.log(`📌 Conversation ${convId} added to link conversations (first message received)`);
+        // console.log(`📌 Conversation ${convId} added to link conversations (first message received)`);
         
         // Notify creator about new conversation
         io.to(`link_${conversation.linkId}`).emit('new-conversation', { conversation });
       }
     }
     
-    console.log(`📨 Message saved in ${convId}: "${message.substring(0, 30)}..." [ID: ${finalMessageId}]`);
+    // console.log(`📨 Message sent in ${convId}: "${message.substring(0, 30)}..."`);
     
-    // CRITICAL: Broadcast to others only (exclude sender to prevent duplicates)
+    // FIXED: Broadcast to others only (exclude sender to prevent duplicates)
     socket.broadcast.to(convId).emit('new-message', { 
       convId, 
       message: newMessage 
     });
     
-    // Send confirmation back to sender only
+    // Send confirmation back to sender only (optional)
     socket.emit('message-sent', { 
       convId, 
-      message: newMessage,
-      messageId: finalMessageId
+      message: newMessage 
     });
     
     // Notify creator in link room about updated conversation
@@ -333,7 +311,7 @@ io.on('connection', (socket) => {
   
   // Handle disconnection
   socket.on('disconnect', () => {
-    console.log('👋 User disconnected:', socket.id);
+    // console.log('👋 User disconnected:', socket.id);
   });
 });
 
@@ -346,7 +324,6 @@ server.listen(PORT, () => {
   ║   Port: ${PORT}                           ║
   ║   Status: ✓ Ready                      ║
   ║   Auto-delete: 24 hours                ║
-  ║   Duplicate Prevention: ✓ Active       ║
   ╚════════════════════════════════════════╝
   `);
   

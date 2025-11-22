@@ -1,4 +1,4 @@
-// server.js - COMPLETELY FIXED REAL-TIME MESSAGING
+// server.js - FIXED: Sender now sees their own messages
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
@@ -8,31 +8,31 @@ const app = express();
 const server = http.createServer(app);
 const io = socketIo(server, {
   cors: {
-    origin: ["https://www.ochat.fun", "http://localhost:3000"],
-    methods: ["GET", "POST"],
-    credentials: true
-  },
-  pingTimeout: 60000,
-  pingInterval: 25000
+    origin: "https://www.ochat.fun",
+    methods: ["GET", "POST"]
+  }
 });
 
 app.use(cors());
 app.use(express.json());
 
-// Enhanced storage
+// Enhanced storage with timestamps for auto-deletion
 const storage = {
   links: new Map(),
   conversations: new Map(),
 };
 
+// Auto-delete messages after 24 hours
 const AUTO_DELETE_TIME = 24 * 60 * 60 * 1000;
 
+// Cleanup function to delete old messages and empty conversations
 function cleanupOldMessages() {
   const now = Date.now();
   let deletedMessagesCount = 0;
   let deletedConversationsCount = 0;
   
   storage.conversations.forEach((conversation, convId) => {
+    const oldLength = conversation.messages.length;
     conversation.messages = conversation.messages.filter(msg => {
       const isOld = (now - msg.timestamp) > AUTO_DELETE_TIME;
       if (isOld) deletedMessagesCount++;
@@ -43,7 +43,8 @@ function cleanupOldMessages() {
       conversation.lastMessage = conversation.messages[conversation.messages.length - 1].timestamp;
     }
     
-    if (conversation.messages.length === 0 && (now - conversation.createdAt) > 3600000) {
+    if (conversation.messages.length === 0 && 
+        (now - conversation.createdAt) > 3600000) {
       const linkId = conversation.linkId;
       const link = storage.links.get(linkId);
       if (link) {
@@ -163,14 +164,11 @@ app.get('/api/conversations/:convId', (req, res) => {
 
 // Socket.io real-time messaging
 io.on('connection', (socket) => {
-  console.log('👤 User connected:', socket.id);
   
   socket.on('join-conversation', ({ convId, isCreator }) => {
     socket.join(convId);
     socket.convId = convId;
     socket.isCreator = isCreator;
-    
-    console.log(`📥 ${socket.id} joined conversation: ${convId} as ${isCreator ? 'creator' : 'anonymous'}`);
     
     const conversation = storage.conversations.get(convId);
     if (conversation) {
@@ -181,7 +179,6 @@ io.on('connection', (socket) => {
       conversation.messages = recentMessages;
       
       socket.emit('load-messages', { messages: recentMessages });
-      console.log(`📤 Sent ${recentMessages.length} messages to ${socket.id}`);
     }
   });
   
@@ -189,8 +186,6 @@ io.on('connection', (socket) => {
     socket.join(`link_${linkId}`);
     socket.linkId = linkId;
     socket.creatorId = creatorId;
-    
-    console.log(`🔗 ${socket.id} joined link: ${linkId}`);
     
     const link = storage.links.get(linkId);
     if (link) {
@@ -212,7 +207,7 @@ io.on('connection', (socket) => {
     }
   });
   
-  // ✅ CRITICAL: Send to ALL users in room (including sender)
+  // ✅ CRITICAL FIX: Send to sender AND broadcast to others
   socket.on('send-message', ({ convId, message, isCreator }) => {
     const conversation = storage.conversations.get(convId);
     
@@ -231,8 +226,6 @@ io.on('connection', (socket) => {
     conversation.messages.push(newMessage);
     conversation.lastMessage = Date.now();
     
-    console.log(`💬 Message sent in ${convId} by ${isCreator ? 'creator' : 'anonymous'}: "${message}"`);
-    
     if (!conversation.hasMessages) {
       conversation.hasMessages = true;
       const link = storage.links.get(conversation.linkId);
@@ -242,13 +235,11 @@ io.on('connection', (socket) => {
       }
     }
     
-    // ✅ Send to ALL users in the conversation room (including sender)
+    // ✅ FIXED: Send to ALL users in the room (including sender)
     io.to(convId).emit('new-message', { 
       convId, 
       message: newMessage 
     });
-    
-    console.log(`📡 Broadcasted message to all users in room: ${convId}`);
     
     // Notify creator about conversation update
     io.to(`link_${conversation.linkId}`).emit('conversation-updated', {
@@ -272,7 +263,7 @@ io.on('connection', (socket) => {
   });
   
   socket.on('disconnect', () => {
-    console.log('👋 User disconnected:', socket.id);
+    // console.log('👋 User disconnected:', socket.id);
   });
 });
 

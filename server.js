@@ -1,4 +1,4 @@
-// server.js - FIXED: Sender now sees their own messages
+// server.js - Fixed to send messages to ALL users including sender
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
@@ -207,7 +207,7 @@ io.on('connection', (socket) => {
     }
   });
   
-  // ✅ CRITICAL FIX: Send to sender AND broadcast to others
+  // ✅ CRITICAL FIX: Broadcast to room EXCEPT sender, sender adds message optimistically
   socket.on('send-message', ({ convId, message, isCreator }) => {
     const conversation = storage.conversations.get(convId);
     
@@ -235,8 +235,8 @@ io.on('connection', (socket) => {
       }
     }
     
-    // ✅ FIXED: Send to ALL users in the room (including sender)
-    io.to(convId).emit('new-message', { 
+    // ✅ Broadcast to OTHER users only (sender already has the message from optimistic update)
+    socket.broadcast.to(convId).emit('new-message', { 
       convId, 
       message: newMessage 
     });

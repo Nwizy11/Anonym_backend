@@ -1,4 +1,4 @@
-// server.js - COMPLETELY FIXED - No more duplicates
+// server.js - FIXED: Sender now sees their own messages
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
@@ -207,7 +207,7 @@ io.on('connection', (socket) => {
     }
   });
   
-  // ✅ CRITICAL FIX: Use socket.broadcast.to() instead of io.to()
+  // ✅ CRITICAL FIX: Send to sender AND broadcast to others
   socket.on('send-message', ({ convId, message, isCreator }) => {
     const conversation = storage.conversations.get(convId);
     
@@ -235,8 +235,8 @@ io.on('connection', (socket) => {
       }
     }
     
-    // ✅ FIXED: Broadcast to OTHER users only (exclude sender)
-    socket.broadcast.to(convId).emit('new-message', { 
+    // ✅ FIXED: Send to ALL users in the room (including sender)
+    io.to(convId).emit('new-message', { 
       convId, 
       message: newMessage 
     });

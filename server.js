@@ -17,8 +17,11 @@ const io = socketIo(server, {
 app.use(cors());
 app.use(express.json());
 
-// Connect to MongoDB - FIXED: Removed deprecated options
-mongoose.connect("mongodb+srv://officialpinny_db_user:bNLCeFnKTwEYYy6G@ochat.dhm58w6.mongodb.net/?appName=Ochat")
+// Connect to MongoDB with increased timeouts
+mongoose.connect("mongodb+srv://officialpinny_db_user:bNLCeFnKTwEYYy6G@ochat.dhm58w6.mongodb.net/?appName=Ochat", {
+  serverSelectionTimeoutMS: 30000, // 30 seconds for server selection
+  socketTimeoutMS: 45000, // 45 seconds for socket operations
+})
   .then(() => {
     console.log('✅ Connected to MongoDB');
   })
@@ -64,32 +67,53 @@ ConversationSchema.index({ lastMessage: 1 }, { expireAfterSeconds: 86400 });
 const Link = mongoose.model('Link', LinkSchema);
 const Conversation = mongoose.model('Conversation', ConversationSchema);
 
-// Cleanup function - delete conversations whose links have expired
+// Ensure indexes are created on startup
+Link.createIndexes()
+  .then(() => console.log('✅ Link indexes created'))
+  .catch(err => console.error('❌ Link index error:', err));
+
+Conversation.createIndexes()
+  .then(() => console.log('✅ Conversation indexes created'))
+  .catch(err => console.error('❌ Conversation index error:', err));
+
+// Optimized cleanup function - More efficient bulk operations
 async function cleanupOrphanedConversations() {
   try {
-    const allConversations = await Conversation.find({}, 'convId linkId').lean();
-    let deletedCount = 0;
+    // Get all unique linkIds from conversations
+    const conversationLinkIds = await Conversation.distinct('linkId')
+      .maxTimeMS(10000);
     
-    for (const conv of allConversations) {
-      const link = await Link.findOne({ linkId: conv.linkId });
-      if (!link) {
-        await Conversation.deleteOne({ convId: conv.convId });
-        deletedCount++;
-      }
+    if (conversationLinkIds.length === 0) {
+      console.log('🗑️ Cleanup: No conversations to check');
+      return;
     }
+    
+    // Get all valid linkIds
+    const validLinks = await Link.find({ 
+      linkId: { $in: conversationLinkIds } 
+    })
+    .distinct('linkId')
+    .maxTimeMS(10000);
+    
+    // Delete conversations with invalid/expired links
+    const orphanedResult = await Conversation.deleteMany({
+      linkId: { $nin: validLinks }
+    }).maxTimeMS(10000);
     
     // Delete empty conversations older than 1 hour
     const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
     const emptyDeleted = await Conversation.deleteMany({
       hasMessages: false,
       createdAt: { $lt: oneHourAgo }
-    });
+    }).maxTimeMS(10000);
     
-    if (deletedCount > 0 || emptyDeleted.deletedCount > 0) {
-      console.log(`🗑️ Cleanup: Deleted ${deletedCount} orphaned conversations, ${emptyDeleted.deletedCount} empty conversations`);
+    if (orphanedResult.deletedCount > 0 || emptyDeleted.deletedCount > 0) {
+      console.log(`🗑️ Cleanup: Deleted ${orphanedResult.deletedCount} orphaned conversations, ${emptyDeleted.deletedCount} empty conversations`);
+    } else {
+      console.log('🗑️ Cleanup: No conversations to delete');
     }
   } catch (error) {
-    console.error('Cleanup error:', error);
+    console.error('Cleanup error:', error.message);
   }
 }
 
@@ -130,7 +154,9 @@ app.post('/api/links/create', async (req, res) => {
 app.get('/api/links/:linkId', async (req, res) => {
   try {
     const { linkId } = req.params;
-    const link = await Link.findOne({ linkId }).lean();
+    const link = await Link.findOne({ linkId })
+      .maxTimeMS(5000)
+      .lean();
     
     if (!link) {
       return res.status(404).json({ error: 'Link not found or expired' });
@@ -154,7 +180,9 @@ app.get('/api/links/:linkId', async (req, res) => {
 app.get('/api/links/:linkId/verify', async (req, res) => {
   try {
     const { linkId } = req.params;
-    const link = await Link.findOne({ linkId }).lean();
+    const link = await Link.findOne({ linkId })
+      .maxTimeMS(5000)
+      .lean();
     
     if (!link) {
       return res.status(404).json({ error: 'Link not found or expired', exists: false });
@@ -181,7 +209,9 @@ app.get('/api/links/:linkId/conversations', async (req, res) => {
     const { linkId } = req.params;
     
     // Verify link exists
-    const link = await Link.findOne({ linkId });
+    const link = await Link.findOne({ linkId })
+      .maxTimeMS(5000);
+    
     if (!link) {
       return res.status(404).json({ error: 'Link not found or expired' });
     }
@@ -192,6 +222,7 @@ app.get('/api/links/:linkId/conversations', async (req, res) => {
       hasMessages: true 
     })
     .sort({ lastMessage: -1 })
+    .maxTimeMS(10000)
     .lean();
     
     // Format for frontend
@@ -218,7 +249,9 @@ app.post('/api/conversations/create', async (req, res) => {
     const { linkId } = req.body;
     
     // Verify link exists and hasn't expired
-    const link = await Link.findOne({ linkId });
+    const link = await Link.findOne({ linkId })
+      .maxTimeMS(5000);
+    
     if (!link) {
       return res.status(404).json({ error: 'Link not found or expired' });
     }
@@ -260,14 +293,18 @@ app.post('/api/conversations/create', async (req, res) => {
 app.get('/api/conversations/:convId', async (req, res) => {
   try {
     const { convId } = req.params;
-    const conversation = await Conversation.findOne({ convId }).lean();
+    const conversation = await Conversation.findOne({ convId })
+      .maxTimeMS(5000)
+      .lean();
     
     if (!conversation) {
       return res.status(404).json({ error: 'Conversation not found' });
     }
     
     // Verify the link still exists
-    const link = await Link.findOne({ linkId: conversation.linkId });
+    const link = await Link.findOne({ linkId: conversation.linkId })
+      .maxTimeMS(5000);
+    
     if (!link) {
       // Link expired, delete conversation
       await Conversation.deleteOne({ convId });
@@ -303,10 +340,15 @@ io.on('connection', (socket) => {
       socket.isCreator = isCreator;
       
       // Load and send existing messages
-      const conversation = await Conversation.findOne({ convId }).lean();
+      const conversation = await Conversation.findOne({ convId })
+        .maxTimeMS(5000)
+        .lean();
+      
       if (conversation) {
         // Verify link still exists
-        const link = await Link.findOne({ linkId: conversation.linkId });
+        const link = await Link.findOne({ linkId: conversation.linkId })
+          .maxTimeMS(5000);
+        
         if (!link) {
           socket.emit('error', { message: 'Chat link has expired' });
           await Conversation.deleteOne({ convId });
@@ -329,7 +371,9 @@ io.on('connection', (socket) => {
       socket.creatorId = creatorId;
       
       // Verify link exists
-      const link = await Link.findOne({ linkId });
+      const link = await Link.findOne({ linkId })
+        .maxTimeMS(5000);
+      
       if (!link) {
         socket.emit('error', { message: 'Link not found or expired' });
         return;
@@ -341,6 +385,7 @@ io.on('connection', (socket) => {
         hasMessages: true 
       })
       .sort({ lastMessage: -1 })
+      .maxTimeMS(10000)
       .lean();
       
       // Format for frontend
@@ -364,7 +409,8 @@ io.on('connection', (socket) => {
   // Send message
   socket.on('send-message', async ({ convId, message, isCreator }) => {
     try {
-      const conversation = await Conversation.findOne({ convId });
+      const conversation = await Conversation.findOne({ convId })
+        .maxTimeMS(5000);
       
       if (!conversation) {
         socket.emit('error', { message: 'Conversation not found' });
@@ -372,7 +418,9 @@ io.on('connection', (socket) => {
       }
       
       // Verify link still exists
-      const link = await Link.findOne({ linkId: conversation.linkId });
+      const link = await Link.findOne({ linkId: conversation.linkId })
+        .maxTimeMS(5000);
+      
       if (!link) {
         socket.emit('error', { message: 'Chat link has expired' });
         await Conversation.deleteOne({ convId });
@@ -449,12 +497,16 @@ server.listen(PORT, () => {
   ║   Ochat Server Running                 ║
   ║   Port: ${PORT}                           ║
   ║   Status: ✓ Ready                      ║
-  ║   Database: MongoDB                    ║
+  ║   Database: MongoDB Atlas              ║
   ║   Link Expiry: 6 hours                 ║
   ║   Message Expiry: 24 hours             ║
+  ║   Timeout Protection: ✓ Enabled        ║
   ╚════════════════════════════════════════╝
   `);
   
-  // Run initial cleanup
-  cleanupOrphanedConversations();
+  // Run initial cleanup after 30 seconds (allow indexes to be created first)
+  setTimeout(() => {
+    console.log('🔄 Running initial cleanup...');
+    cleanupOrphanedConversations();
+  }, 30000);
 });

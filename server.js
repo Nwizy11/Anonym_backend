@@ -1,8 +1,9 @@
-// server.js - Fixed to send messages to ALL users including sender
+// server.js - MongoDB Integrated with 6-hour link expiry
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
+const mongoose = require('mongoose');
 
 const app = express();
 const server = http.createServer(app);
@@ -16,244 +17,417 @@ const io = socketIo(server, {
 app.use(cors());
 app.use(express.json());
 
-// Enhanced storage with timestamps for auto-deletion
-const storage = {
-  links: new Map(),
-  conversations: new Map(),
-};
+// Connect to MongoDB - FIXED: Removed deprecated options
+mongoose.connect("mongodb+srv://officialpinny_db_user:bNLCeFnKTwEYYy6G@ochat.dhm58w6.mongodb.net/?appName=Ochat")
+  .then(() => {
+    console.log('✅ Connected to MongoDB');
+  })
+  .catch(err => {
+    console.error('❌ MongoDB connection error:', err);
+    process.exit(1);
+  });
 
-// Auto-delete messages after 24 hours
-const AUTO_DELETE_TIME = 24 * 60 * 60 * 1000;
+// Link Schema - Auto-delete after 6 hours
+const LinkSchema = new mongoose.Schema({
+  linkId: { type: String, unique: true, required: true, index: true },
+  creatorId: { type: String, required: true },
+  createdAt: { 
+    type: Date, 
+    default: Date.now,
+    expires: 21600 // 6 hours in seconds (6 * 60 * 60)
+  }
+});
 
-// Cleanup function to delete old messages and empty conversations
-function cleanupOldMessages() {
-  const now = Date.now();
-  let deletedMessagesCount = 0;
-  let deletedConversationsCount = 0;
-  
-  storage.conversations.forEach((conversation, convId) => {
-    const oldLength = conversation.messages.length;
-    conversation.messages = conversation.messages.filter(msg => {
-      const isOld = (now - msg.timestamp) > AUTO_DELETE_TIME;
-      if (isOld) deletedMessagesCount++;
-      return !isOld;
+// Conversation Schema - Auto-delete 24 hours after last message
+const ConversationSchema = new mongoose.Schema({
+  convId: { type: String, unique: true, required: true, index: true },
+  linkId: { type: String, required: true, index: true },
+  anonymousUserId: { type: String },
+  messages: [{
+    id: { type: Number },
+    text: { type: String, required: true },
+    isCreator: { type: Boolean, required: true },
+    timestamp: { type: Number, required: true }
+  }],
+  createdAt: { type: Date, default: Date.now },
+  lastMessage: { 
+    type: Date, 
+    default: Date.now,
+    index: true
+  },
+  hasMessages: { type: Boolean, default: false }
+});
+
+// TTL index - delete conversations 24 hours after last message
+ConversationSchema.index({ lastMessage: 1 }, { expireAfterSeconds: 86400 });
+
+const Link = mongoose.model('Link', LinkSchema);
+const Conversation = mongoose.model('Conversation', ConversationSchema);
+
+// Cleanup function - delete conversations whose links have expired
+async function cleanupOrphanedConversations() {
+  try {
+    const allConversations = await Conversation.find({}, 'convId linkId').lean();
+    let deletedCount = 0;
+    
+    for (const conv of allConversations) {
+      const link = await Link.findOne({ linkId: conv.linkId });
+      if (!link) {
+        await Conversation.deleteOne({ convId: conv.convId });
+        deletedCount++;
+      }
+    }
+    
+    // Delete empty conversations older than 1 hour
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000);
+    const emptyDeleted = await Conversation.deleteMany({
+      hasMessages: false,
+      createdAt: { $lt: oneHourAgo }
     });
     
-    if (conversation.messages.length > 0) {
-      conversation.lastMessage = conversation.messages[conversation.messages.length - 1].timestamp;
+    if (deletedCount > 0 || emptyDeleted.deletedCount > 0) {
+      console.log(`🗑️ Cleanup: Deleted ${deletedCount} orphaned conversations, ${emptyDeleted.deletedCount} empty conversations`);
     }
-    
-    if (conversation.messages.length === 0 && 
-        (now - conversation.createdAt) > 3600000) {
-      const linkId = conversation.linkId;
-      const link = storage.links.get(linkId);
-      if (link) {
-        link.conversations = link.conversations.filter(id => id !== convId);
-      }
-      storage.conversations.delete(convId);
-      deletedConversationsCount++;
-    }
-  });
-  
-  if (deletedMessagesCount > 0 || deletedConversationsCount > 0) {
-    console.log(`🗑️  Cleanup: Deleted ${deletedMessagesCount} messages and ${deletedConversationsCount} empty conversations`);
+  } catch (error) {
+    console.error('Cleanup error:', error);
   }
 }
 
-setInterval(cleanupOldMessages, 60 * 60 * 1000);
+// Run cleanup every hour
+setInterval(cleanupOrphanedConversations, 60 * 60 * 1000);
 
 // API Routes
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', message: 'Anonymous Chat Server Running' });
-});
-
-app.post('/api/links/create', (req, res) => {
-  const linkId = `link_${Math.random().toString(36).substr(2, 9)}`;
-  const creatorId = `creator_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-  
-  storage.links.set(linkId, {
-    id: linkId,
-    creatorId,
-    createdAt: Date.now(),
-    conversations: []
+  res.json({ 
+    status: 'ok', 
+    message: 'Ochat Server Running',
+    database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
   });
-  
-  console.log(`✅ New link created: ${linkId}`);
-  res.json({ linkId, creatorId });
 });
 
-app.get('/api/links/:linkId', (req, res) => {
-  const { linkId } = req.params;
-  const link = storage.links.get(linkId);
-  
-  if (!link) {
-    return res.status(404).json({ error: 'Link not found' });
+// Create a new chat link (expires in 6 hours)
+app.post('/api/links/create', async (req, res) => {
+  try {
+    const linkId = `link_${Math.random().toString(36).substr(2, 9)}`;
+    const creatorId = `creator_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    
+    const link = new Link({
+      linkId,
+      creatorId
+    });
+    
+    await link.save();
+    
+    console.log(`✅ New link created: ${linkId} (expires in 6 hours)`);
+    res.json({ linkId, creatorId });
+  } catch (error) {
+    console.error('Error creating link:', error);
+    res.status(500).json({ error: 'Failed to create link' });
   }
-  
-  res.json({ link });
 });
 
-app.get('/api/links/:linkId/verify', (req, res) => {
-  const { linkId } = req.params;
-  const link = storage.links.get(linkId);
-  
-  if (!link) {
-    return res.status(404).json({ error: 'Link not found', exists: false });
+// Get link info
+app.get('/api/links/:linkId', async (req, res) => {
+  try {
+    const { linkId } = req.params;
+    const link = await Link.findOne({ linkId }).lean();
+    
+    if (!link) {
+      return res.status(404).json({ error: 'Link not found or expired' });
+    }
+    
+    res.json({ 
+      link: {
+        id: link.linkId,
+        linkId: link.linkId,
+        creatorId: link.creatorId,
+        createdAt: link.createdAt.getTime()
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching link:', error);
+    res.status(500).json({ error: 'Server error' });
   }
-  
-  res.json({ exists: true, link });
 });
 
-app.get('/api/links/:linkId/conversations', (req, res) => {
-  const { linkId } = req.params;
-  const link = storage.links.get(linkId);
-  
-  if (!link) {
-    return res.status(404).json({ error: 'Link not found' });
+// Verify link exists
+app.get('/api/links/:linkId/verify', async (req, res) => {
+  try {
+    const { linkId } = req.params;
+    const link = await Link.findOne({ linkId }).lean();
+    
+    if (!link) {
+      return res.status(404).json({ error: 'Link not found or expired', exists: false });
+    }
+    
+    res.json({ 
+      exists: true, 
+      link: {
+        id: link.linkId,
+        linkId: link.linkId,
+        creatorId: link.creatorId,
+        createdAt: link.createdAt.getTime()
+      }
+    });
+  } catch (error) {
+    console.error('Error verifying link:', error);
+    res.status(500).json({ error: 'Server error', exists: false });
   }
-  
-  const conversations = link.conversations
-    .map(convId => storage.conversations.get(convId))
-    .filter(conv => conv && conv.messages && conv.messages.length > 0);
-  
-  res.json({ conversations });
 });
 
-app.post('/api/conversations/create', (req, res) => {
-  const { linkId } = req.body;
-  const link = storage.links.get(linkId);
-  
-  if (!link) {
-    return res.status(404).json({ error: 'Link not found' });
+// Get conversations for a link
+app.get('/api/links/:linkId/conversations', async (req, res) => {
+  try {
+    const { linkId } = req.params;
+    
+    // Verify link exists
+    const link = await Link.findOne({ linkId });
+    if (!link) {
+      return res.status(404).json({ error: 'Link not found or expired' });
+    }
+    
+    // Get conversations with messages only
+    const conversations = await Conversation.find({ 
+      linkId,
+      hasMessages: true 
+    })
+    .sort({ lastMessage: -1 })
+    .lean();
+    
+    // Format for frontend
+    const formattedConversations = conversations.map(conv => ({
+      id: conv.convId,
+      linkId: conv.linkId,
+      anonymousUserId: conv.anonymousUserId,
+      messages: conv.messages,
+      createdAt: conv.createdAt.getTime(),
+      lastMessage: conv.lastMessage.getTime(),
+      hasMessages: conv.hasMessages
+    }));
+    
+    res.json({ conversations: formattedConversations });
+  } catch (error) {
+    console.error('Error fetching conversations:', error);
+    res.status(500).json({ error: 'Server error' });
   }
-  
-  const convId = `conv_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-  const anonymousUserId = `anon_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-  
-  const conversation = {
-    id: convId,
-    linkId,
-    anonymousUserId,
-    messages: [],
-    createdAt: Date.now(),
-    lastMessage: Date.now(),
-    hasMessages: false
-  };
-  
-  storage.conversations.set(convId, conversation);
-  
-  console.log(`💬 New conversation created: ${convId} for link: ${linkId}`);
-  res.json({ conversation });
 });
 
-app.get('/api/conversations/:convId', (req, res) => {
-  const { convId } = req.params;
-  const conversation = storage.conversations.get(convId);
-  
-  if (!conversation) {
-    return res.status(404).json({ error: 'Conversation not found' });
+// Create a new conversation
+app.post('/api/conversations/create', async (req, res) => {
+  try {
+    const { linkId } = req.body;
+    
+    // Verify link exists and hasn't expired
+    const link = await Link.findOne({ linkId });
+    if (!link) {
+      return res.status(404).json({ error: 'Link not found or expired' });
+    }
+    
+    const convId = `conv_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const anonymousUserId = `anon_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    
+    const conversation = new Conversation({
+      convId,
+      linkId,
+      anonymousUserId,
+      messages: [],
+      hasMessages: false
+    });
+    
+    await conversation.save();
+    
+    console.log(`💬 New conversation created: ${convId} for link: ${linkId}`);
+    
+    // Format for frontend
+    res.json({ 
+      conversation: {
+        id: convId,
+        linkId,
+        anonymousUserId,
+        messages: [],
+        createdAt: conversation.createdAt.getTime(),
+        lastMessage: conversation.lastMessage.getTime(),
+        hasMessages: false
+      }
+    });
+  } catch (error) {
+    console.error('Error creating conversation:', error);
+    res.status(500).json({ error: 'Failed to create conversation' });
   }
-  
-  const now = Date.now();
-  conversation.messages = conversation.messages.filter(msg => 
-    (now - msg.timestamp) <= AUTO_DELETE_TIME
-  );
-  
-  res.json({ conversation });
+});
+
+// Get conversation by ID
+app.get('/api/conversations/:convId', async (req, res) => {
+  try {
+    const { convId } = req.params;
+    const conversation = await Conversation.findOne({ convId }).lean();
+    
+    if (!conversation) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+    
+    // Verify the link still exists
+    const link = await Link.findOne({ linkId: conversation.linkId });
+    if (!link) {
+      // Link expired, delete conversation
+      await Conversation.deleteOne({ convId });
+      return res.status(404).json({ error: 'Chat link has expired' });
+    }
+    
+    // Format for frontend
+    res.json({ 
+      conversation: {
+        id: conversation.convId,
+        linkId: conversation.linkId,
+        anonymousUserId: conversation.anonymousUserId,
+        messages: conversation.messages,
+        createdAt: conversation.createdAt.getTime(),
+        lastMessage: conversation.lastMessage.getTime(),
+        hasMessages: conversation.hasMessages
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching conversation:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
 });
 
 // Socket.io real-time messaging
 io.on('connection', (socket) => {
   
-  socket.on('join-conversation', ({ convId, isCreator }) => {
-    socket.join(convId);
-    socket.convId = convId;
-    socket.isCreator = isCreator;
-    
-    const conversation = storage.conversations.get(convId);
-    if (conversation) {
-      const now = Date.now();
-      const recentMessages = conversation.messages.filter(msg => 
-        (now - msg.timestamp) <= AUTO_DELETE_TIME
-      );
-      conversation.messages = recentMessages;
+  // Join a conversation room
+  socket.on('join-conversation', async ({ convId, isCreator }) => {
+    try {
+      socket.join(convId);
+      socket.convId = convId;
+      socket.isCreator = isCreator;
       
-      socket.emit('load-messages', { messages: recentMessages });
+      // Load and send existing messages
+      const conversation = await Conversation.findOne({ convId }).lean();
+      if (conversation) {
+        // Verify link still exists
+        const link = await Link.findOne({ linkId: conversation.linkId });
+        if (!link) {
+          socket.emit('error', { message: 'Chat link has expired' });
+          await Conversation.deleteOne({ convId });
+          return;
+        }
+        
+        socket.emit('load-messages', { messages: conversation.messages });
+      }
+    } catch (error) {
+      console.error('Error joining conversation:', error);
+      socket.emit('error', { message: 'Failed to join conversation' });
     }
   });
   
-  socket.on('join-link', ({ linkId, creatorId }) => {
-    socket.join(`link_${linkId}`);
-    socket.linkId = linkId;
-    socket.creatorId = creatorId;
-    
-    const link = storage.links.get(linkId);
-    if (link) {
-      const now = Date.now();
-      const conversations = link.conversations
-        .map(convId => {
-          const conv = storage.conversations.get(convId);
-          if (conv && conv.messages && conv.messages.length > 0) {
-            conv.messages = conv.messages.filter(msg => 
-              (now - msg.timestamp) <= AUTO_DELETE_TIME
-            );
-            return conv;
-          }
-          return null;
-        })
-        .filter(Boolean);
+  // Join link room (for creator)
+  socket.on('join-link', async ({ linkId, creatorId }) => {
+    try {
+      socket.join(`link_${linkId}`);
+      socket.linkId = linkId;
+      socket.creatorId = creatorId;
       
-      socket.emit('load-conversations', { conversations });
+      // Verify link exists
+      const link = await Link.findOne({ linkId });
+      if (!link) {
+        socket.emit('error', { message: 'Link not found or expired' });
+        return;
+      }
+      
+      // Send existing conversations
+      const conversations = await Conversation.find({ 
+        linkId,
+        hasMessages: true 
+      })
+      .sort({ lastMessage: -1 })
+      .lean();
+      
+      // Format for frontend
+      const formattedConversations = conversations.map(conv => ({
+        id: conv.convId,
+        linkId: conv.linkId,
+        anonymousUserId: conv.anonymousUserId,
+        messages: conv.messages,
+        createdAt: conv.createdAt.getTime(),
+        lastMessage: conv.lastMessage.getTime(),
+        hasMessages: conv.hasMessages
+      }));
+      
+      socket.emit('load-conversations', { conversations: formattedConversations });
+    } catch (error) {
+      console.error('Error joining link:', error);
+      socket.emit('error', { message: 'Failed to join link' });
     }
   });
   
-  // ✅ CRITICAL FIX: Broadcast to room EXCEPT sender, sender adds message optimistically
-  socket.on('send-message', ({ convId, message, isCreator }) => {
-    const conversation = storage.conversations.get(convId);
-    
-    if (!conversation) {
-      socket.emit('error', { message: 'Conversation not found' });
-      return;
-    }
-    
-    const newMessage = {
-      id: Date.now() + Math.random(),
-      text: message,
-      isCreator,
-      timestamp: Date.now()
-    };
-    
-    conversation.messages.push(newMessage);
-    conversation.lastMessage = Date.now();
-    
-    if (!conversation.hasMessages) {
+  // Send message
+  socket.on('send-message', async ({ convId, message, isCreator }) => {
+    try {
+      const conversation = await Conversation.findOne({ convId });
+      
+      if (!conversation) {
+        socket.emit('error', { message: 'Conversation not found' });
+        return;
+      }
+      
+      // Verify link still exists
+      const link = await Link.findOne({ linkId: conversation.linkId });
+      if (!link) {
+        socket.emit('error', { message: 'Chat link has expired' });
+        await Conversation.deleteOne({ convId });
+        return;
+      }
+      
+      const newMessage = {
+        id: Date.now() + Math.random(),
+        text: message,
+        isCreator,
+        timestamp: Date.now()
+      };
+      
+      // Add message and update conversation
+      conversation.messages.push(newMessage);
+      conversation.lastMessage = new Date();
       conversation.hasMessages = true;
-      const link = storage.links.get(conversation.linkId);
-      if (link && !link.conversations.includes(convId)) {
-        link.conversations.push(convId);
-        io.to(`link_${conversation.linkId}`).emit('new-conversation', { conversation });
-      }
-    }
-    
-    // ✅ Broadcast to OTHER users only (sender already has the message from optimistic update)
-    socket.broadcast.to(convId).emit('new-message', { 
-      convId, 
-      message: newMessage 
-    });
-    
-    // Notify creator about conversation update
-    io.to(`link_${conversation.linkId}`).emit('conversation-updated', {
-      conversation: {
-        id: conversation.id,
+      
+      await conversation.save();
+      
+      // Broadcast to OTHER users only (sender already has message from optimistic update)
+      socket.broadcast.to(convId).emit('new-message', { 
+        convId, 
+        message: newMessage 
+      });
+      
+      // Notify creator in link room about conversation update
+      const formattedConversation = {
+        id: conversation.convId,
         linkId: conversation.linkId,
-        lastMessage: conversation.lastMessage,
+        anonymousUserId: conversation.anonymousUserId,
         messages: conversation.messages,
-        createdAt: conversation.createdAt,
+        createdAt: conversation.createdAt.getTime(),
+        lastMessage: conversation.lastMessage.getTime(),
         hasMessages: conversation.hasMessages
+      };
+      
+      io.to(`link_${conversation.linkId}`).emit('conversation-updated', {
+        conversation: formattedConversation
+      });
+      
+      // If first message, notify about new conversation
+      if (conversation.messages.length === 1) {
+        io.to(`link_${conversation.linkId}`).emit('new-conversation', { 
+          conversation: formattedConversation 
+        });
       }
-    });
+      
+    } catch (error) {
+      console.error('Error sending message:', error);
+      socket.emit('error', { message: 'Failed to send message' });
+    }
   });
   
+  // Typing indicator
   socket.on('typing', ({ convId, isCreator }) => {
     socket.to(convId).emit('user-typing', { isCreator });
   });
@@ -263,7 +437,7 @@ io.on('connection', (socket) => {
   });
   
   socket.on('disconnect', () => {
-    // console.log('👋 User disconnected:', socket.id);
+    // Cleanup handled by socket.io
   });
 });
 
@@ -272,12 +446,15 @@ const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
   console.log(`
   ╔════════════════════════════════════════╗
-  ║   Anonymous Chat Server Running        ║
+  ║   Ochat Server Running                 ║
   ║   Port: ${PORT}                           ║
   ║   Status: ✓ Ready                      ║
-  ║   Auto-delete: 24 hours                ║
+  ║   Database: MongoDB                    ║
+  ║   Link Expiry: 6 hours                 ║
+  ║   Message Expiry: 24 hours             ║
   ╚════════════════════════════════════════╝
   `);
   
-  cleanupOldMessages();
+  // Run initial cleanup
+  cleanupOrphanedConversations();
 });

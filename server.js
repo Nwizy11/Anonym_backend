@@ -1,4 +1,4 @@
-// server.js - MongoDB Integrated with 6-hour link expiry
+// server.js - MongoDB Integrated with 6-hour link expiry and reply support
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
@@ -30,14 +30,14 @@ mongoose.connect("mongodb+srv://officialpinny_db_user:bNLCeFnKTwEYYy6G@ochat.dhm
     process.exit(1);
   });
 
-// Link Schema - Auto-delete after 6 hours
+// Link Schema - Auto-delete after 12 hours
 const LinkSchema = new mongoose.Schema({
   linkId: { type: String, unique: true, required: true, index: true },
   creatorId: { type: String, required: true },
   createdAt: { 
     type: Date, 
     default: Date.now,
-    expires: 21600 // 6 hours in seconds (6 * 60 * 60)
+    expires: 43200 // 12 hours in seconds (12 * 60 * 60)
   }
 });
 
@@ -48,9 +48,16 @@ const ConversationSchema = new mongoose.Schema({
   anonymousUserId: { type: String },
   messages: [{
     id: { type: Number },
-    text: { type: String, required: true },
+    text: { type: String },
     isCreator: { type: Boolean, required: true },
-    timestamp: { type: Number, required: true }
+    timestamp: { type: Number, required: true },
+    replyTo: {
+      id: { type: Number },
+      text: { type: String },
+      isCreator: { type: Boolean },
+      hasImage: { type: Boolean }
+    },
+    image: { type: String } // Base64 encoded image
   }],
   createdAt: { type: Date, default: Date.now },
   lastMessage: { 
@@ -129,7 +136,7 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Create a new chat link (expires in 6 hours)
+// Create a new chat link (expires in 12 hours)
 app.post('/api/links/create', async (req, res) => {
   try {
     const linkId = `link_${Math.random().toString(36).substr(2, 9)}`;
@@ -142,7 +149,7 @@ app.post('/api/links/create', async (req, res) => {
     
     await link.save();
     
-    console.log(`✅ New link created: ${linkId} (expires in 6 hours)`);
+    console.log(`✅ New link created: ${linkId} (expires in 12 hours)`);
     res.json({ linkId, creatorId });
   } catch (error) {
     console.error('Error creating link:', error);
@@ -406,14 +413,15 @@ io.on('connection', (socket) => {
     }
   });
   
-  // Send message
-  socket.on('send-message', async ({ convId, message, isCreator }) => {
+  // Send message with reply and image support
+  socket.on('send-message', async ({ convId, message, isCreator, replyTo, image }, callback) => {
     try {
       const conversation = await Conversation.findOne({ convId })
         .maxTimeMS(5000);
       
       if (!conversation) {
         socket.emit('error', { message: 'Conversation not found' });
+        if (callback) callback({ success: false, error: 'Conversation not found' });
         return;
       }
       
@@ -424,14 +432,34 @@ io.on('connection', (socket) => {
       if (!link) {
         socket.emit('error', { message: 'Chat link has expired' });
         await Conversation.deleteOne({ convId });
+        if (callback) callback({ success: false, error: 'Chat link has expired' });
         return;
+      }
+
+      // Validate image size (5MB limit in base64)
+      if (image) {
+        const imageSizeInBytes = (image.length * 3) / 4;
+        const maxSize = 5 * 1024 * 1024; // 5MB
+        
+        if (imageSizeInBytes > maxSize) {
+          socket.emit('error', { message: 'Image size exceeds 5MB limit' });
+          if (callback) callback({ success: false, error: 'Image size exceeds 5MB limit' });
+          return;
+        }
       }
       
       const newMessage = {
         id: Date.now() + Math.random(),
-        text: message,
+        text: message || '',
         isCreator,
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        replyTo: replyTo ? {
+          id: replyTo.id,
+          text: replyTo.text,
+          isCreator: replyTo.isCreator,
+          hasImage: replyTo.hasImage
+        } : null,
+        image: image || null
       };
       
       // Add message and update conversation
@@ -441,7 +469,12 @@ io.on('connection', (socket) => {
       
       await conversation.save();
       
-      // Broadcast to OTHER users only (sender already has message from optimistic update)
+      console.log(`💬 Message sent in ${convId}${image ? ' (with image)' : ''}`);
+      
+      // Send success callback to sender
+      if (callback) callback({ success: true, message: newMessage });
+      
+      // Broadcast to OTHER users only
       socket.broadcast.to(convId).emit('new-message', { 
         convId, 
         message: newMessage 
@@ -472,6 +505,7 @@ io.on('connection', (socket) => {
     } catch (error) {
       console.error('Error sending message:', error);
       socket.emit('error', { message: 'Failed to send message' });
+      if (callback) callback({ success: false, error: 'Failed to send message' });
     }
   });
   
@@ -498,9 +532,11 @@ server.listen(PORT, () => {
   ║   Port: ${PORT}                           ║
   ║   Status: ✓ Ready                      ║
   ║   Database: MongoDB Atlas              ║
-  ║   Link Expiry: 6 hours                 ║
+  ║   Link Expiry: 12 hours                ║
   ║   Message Expiry: 24 hours             ║
   ║   Timeout Protection: ✓ Enabled        ║
+  ║   Reply Feature: ✓ Enabled             ║
+  ║   Image Sharing: ✓ Enabled (5MB)       ║
   ╚════════════════════════════════════════╝
   `);
   

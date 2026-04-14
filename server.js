@@ -37,7 +37,7 @@ const LinkSchema = new mongoose.Schema({
   createdAt: { 
     type: Date, 
     default: Date.now,
-    expires: 43200 // 12 hours in seconds (12 * 60 * 60)
+    expires: 259200// 12 hours in seconds (12 * 60 * 60)
   }
 });
 
@@ -69,7 +69,7 @@ const ConversationSchema = new mongoose.Schema({
 });
 
 // TTL index - delete conversations 24 hours after last message
-ConversationSchema.index({ lastMessage: 1 }, { expireAfterSeconds: 86400 });
+ConversationSchema.index({ lastMessage: 1 }, { expireAfterSeconds:  1814400 });
 
 const Link = mongoose.model('Link', LinkSchema);
 const Conversation = mongoose.model('Conversation', ConversationSchema);

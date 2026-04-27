@@ -4,7 +4,11 @@ const http = require('http');
 const socketIo = require('socket.io');
 const cors = require('cors');
 const mongoose = require('mongoose');
-
+const admin = require('firebase-admin');
+admin.initializeApp({
+  credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)),
+});
+console.log('✅ Firebase Admin initialised');
 const app = express();
 const server = http.createServer(app);
 const io = socketIo(server, {
@@ -126,6 +130,75 @@ async function cleanupOrphanedConversations() {
 
 // Run cleanup every hour
 setInterval(cleanupOrphanedConversations, 60 * 60 * 1000);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FCM Push Notification Helper
+// ─────────────────────────────────────────────────────────────────────────────
+ 
+/**
+ * Send a push notification to all devices subscribed to this conversation topic.
+ *
+ * The Flutter app subscribes to topic  "conv_<convId>"  (with _ replacing
+ * non-alphanumeric chars) whenever the user opens a conversation.  This means
+ * push is delivered even when the app is killed / backgrounded.
+ *
+ * @param {string} convId
+ * @param {boolean} senderIsCreator  - true if the creator sent, false if anon
+ * @param {string} messageText
+ * @param {boolean} hasImage
+ * @param {string} linkId
+ */
+async function sendPushNotification(convId, senderIsCreator, messageText, hasImage, linkId) {
+  try {
+    // Build display strings
+    const senderLabel = senderIsCreator ? 'Chat Creator' : 'Anonymous User';
+    const bodyText = hasImage
+      ? (messageText ? `📷 ${messageText}` : '📷 Photo')
+      : (messageText || '');
+ 
+    // Topic name must match what the Flutter app subscribes to
+    const topic = `conv_${convId.replace(/[^a-zA-Z0-9]/g, '_')}`;
+ 
+    const fcmMessage = {
+      topic,
+      notification: {
+        title: `OChat – ${senderLabel}`,
+        body: bodyText.substring(0, 100),
+      },
+      data: {
+        // Passed to onNotificationTap in Flutter so the app can navigate
+        convId,
+        linkId: linkId || '',
+        senderIsCreator: String(senderIsCreator),
+      },
+      android: {
+        priority: 'high',
+        notification: {
+          channelId: 'ochat_messages',  // must match Flutter channel id
+          priority: 'max',
+          defaultSound: true,
+          defaultVibrateTimings: true,
+          visibility: 'public',
+        },
+      },
+      apns: {
+        payload: {
+          aps: {
+            sound: 'default',
+            badge: 1,
+            'content-available': 1,
+          },
+        },
+      },
+    };
+ 
+    const response = await admin.messaging().send(fcmMessage);
+    console.log(`🔔 Push sent to topic ${topic}: ${response}`);
+  } catch (error) {
+    // Log but never crash the server over a notification failure
+    console.error('Push notification error:', error.message);
+  }
+}
 
 // API Routes
 app.get('/api/health', (req, res) => {
@@ -468,6 +541,15 @@ io.on('connection', (socket) => {
       conversation.hasMessages = true;
       
       await conversation.save();
+       // ── FCM Push ──────────────────────────────────────────────────────────────
+      await sendPushNotification(
+        convId,
+        isCreator,
+        message || '',
+        !!image,
+        conversation.linkId
+      );
+      // ─────────────────────────────────────────────────────────────────────────
       
       console.log(`💬 Message sent in ${convId}${image ? ' (with image)' : ''}`);
       
@@ -537,6 +619,7 @@ server.listen(PORT, () => {
   ║   Timeout Protection: ✓ Enabled        ║
   ║   Reply Feature: ✓ Enabled             ║
   ║   Image Sharing: ✓ Enabled (5MB)       ║
+  ║   Push Notifications: ✓ Enabled (FCM)  ║
   ╚════════════════════════════════════════╝
   `);
   
